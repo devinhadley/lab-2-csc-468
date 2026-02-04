@@ -31,13 +31,14 @@ class LockState:
         self.holders.add(txn_id)
 
     def is_queue_not_empty(self) -> bool:
-        return len(self.queue) == 0
+        return len(self.queue) > 0
 
 
 class LockManager:
     def __init__(self) -> None:
         self.locks: dict[str, LockState] = {}  # maps an item to its LockState
 
+    # I return true is txn acquires shared lock for item false otherwise and add it to queue.
     def acquire_shared_lock(self, txn_id: int, item: str) -> bool:
         # Can I acquire this lock?
         # Yes if:
@@ -56,12 +57,24 @@ class LockManager:
         current_lock_state.add_holder(txn_id)
         return True
 
+    # I return true is txn acquires exclusive lock for item false otherwise and add it to queue.
     def acquire_exclusive_lock(self, txn_id: int, item: str) -> bool:
         # Can I acquire this lock?
         # Yes if:
         #   - No one has lock for this item.
         #   - No other transacton is waiting for the lock.
-        #   - Another txn has a shared lock for this item.
+
+        current_lock_state = self.locks[item] = self.locks.get(item, LockState())
+
+        if (
+            current_lock_state.lock_mode != LockMode.NONE
+            or current_lock_state.is_queue_not_empty()
+        ):
+            self.locks[item].queue.append((txn_id, LockMode.EXCLUSIVE))
+            return False
+
+        current_lock_state.set_lock_mode(LockMode.EXCLUSIVE)
+        current_lock_state.add_holder(txn_id)
         return True
 
     def release_locks(self, txn_id: int):
