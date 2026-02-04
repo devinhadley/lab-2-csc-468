@@ -1,0 +1,19 @@
+Two Phase Locking:
+
+  - Central Data Structure:
+    - Lock Table:
+      -  Data item
+      -  Lock mode
+      -  Holding transactions
+      -  Waiting queue
+
+  - Lock Acquisiton Algorithim
+     - Request lock from lock manager
+     - If compatible: grant immediately
+     - If incompatible: block transaction
+     - Resume when lock becomes available
+
+  - Transaction Blocked Operation Queue 
+    - Maps the transactions to the operations that have been skipped due to blocking.
+    - When the transaction acquires a lock we run as many of these operations as possible.
+

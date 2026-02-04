@@ -1,0 +1,4 @@
+{"t":1, "op":"BEGIN"}
+{"t":1, "op":"R", "item":"A"}
+{"t":2, "op":"W", "item":"A", "value":90}
+{"t":1, "op":"COMMIT"}
