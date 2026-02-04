@@ -3,6 +3,7 @@ import argparse
 from enum import Enum
 import os
 import json
+import logging
 
 
 # Strict Two Phase Locking
@@ -30,8 +31,43 @@ class LockState:
     def add_holder(self, txn_id: int) -> None:
         self.holders.add(txn_id)
 
-    def is_queue_not_empty(self) -> bool:
-        return len(self.queue) > 0
+    def is_queue_empty(self) -> bool:
+        return len(self.queue) == 0
+
+    # I remove the transaction from the current lock and update the state and next holder(s) accordingly.
+    # I return which transactions are unblocked.
+    def release_and_grant_next(self, txn_id) -> list[int]:
+        if txn_id not in self.holders:
+            print("Attempted to release lock for transaction which it didn't hold.")
+            return []
+
+        self.holders.remove(txn_id)
+        if len(self.holders) == 0:
+            self.set_lock_mode(LockMode.NONE)
+
+        unblocked = []
+
+        while not self.is_queue_empty():
+            if self.lock_mode == LockMode.EXCLUSIVE:
+                break
+
+            # If shared add while next in queue shared.
+            elif (
+                self.lock_mode == LockMode.SHARED
+                and self.queue[0][1] == LockMode.SHARED
+            ):
+                txn_id, _ = self.queue.popleft()
+                self.holders.add(txn_id)
+                unblocked.append(txn_id)
+
+            # If none pop the next element and set the mode to the request mode.
+            elif self.lock_mode == LockMode.NONE:
+                txn_id, mode = self.queue.popleft()
+                self.lock_mode = mode
+                self.holders.add(txn_id)
+                unblocked.append(txn_id)
+
+        return unblocked
 
 
 class LockManager:
@@ -45,10 +81,18 @@ class LockManager:
         #   - No one has lock for this item.
         #   - No other transacton is waiting for the lock.
         #   - Another txn has a shared lock for this item.
+        #   - I already have it.
+        #    # Already hold this lock? (S or X)
+
         current_lock_state = self.locks[item] = self.locks.get(item, LockState())
-        if (
-            current_lock_state.lock_mode == LockMode.EXCLUSIVE
-            or current_lock_state.is_queue_not_empty()
+
+        if txn_id in current_lock_state.holders:
+            # Already have X → automatically covers S
+            # Already have S → requesting S again, already granted
+            return True
+
+        if current_lock_state.lock_mode == LockMode.EXCLUSIVE or (
+            not current_lock_state.is_queue_empty()
         ):
             self.locks[item].queue.append((txn_id, LockMode.SHARED))
             return False
@@ -63,22 +107,59 @@ class LockManager:
         # Yes if:
         #   - No one has lock for this item.
         #   - No other transacton is waiting for the lock.
+        #   - I already have it
 
         current_lock_state = self.locks[item] = self.locks.get(item, LockState())
 
+        # Already have lock case.
         if (
-            current_lock_state.lock_mode != LockMode.NONE
-            or current_lock_state.is_queue_not_empty()
+            txn_id in current_lock_state.holders
+            and current_lock_state.lock_mode == LockMode.EXCLUSIVE
+        ):
+            return True
+
+        # Upgrade case: have S lock, want X lock.
+        if (
+            txn_id in current_lock_state.holders
+            and current_lock_state.lock_mode == LockMode.SHARED
+        ):
+            # Cannot upgrade if other locks are waiting for exclusive.
+            if not current_lock_state.is_queue_empty():
+                current_lock_state.queue.append((txn_id, LockMode.EXCLUSIVE))
+                return False
+
+            # Can upgrade only if we're the sole holder
+            if len(current_lock_state.holders) == 1:
+                current_lock_state.set_lock_mode(LockMode.EXCLUSIVE)
+                return True
+            else:
+                # Other transactions also hold S, must wait
+                current_lock_state.queue.append((txn_id, LockMode.EXCLUSIVE))
+                return False
+
+        # Not already a holder, can we become exclusive holder?
+        # That is, status must be none and no other transactions waiting.
+        if current_lock_state.lock_mode != LockMode.NONE or (
+            not current_lock_state.is_queue_empty()
         ):
             self.locks[item].queue.append((txn_id, LockMode.EXCLUSIVE))
             return False
 
+        # Otherwise, we are the first to acquire this lock.
         current_lock_state.set_lock_mode(LockMode.EXCLUSIVE)
         current_lock_state.add_holder(txn_id)
         return True
 
-    def release_locks(self, txn_id: int):
-        pass
+    # I release the lock for any items this txn was a holder for.
+    # I return a list of newly unbloked transactions if any.
+    def release_locks(self, txn_id: int) -> list[int]:
+        all_unblocked = set()
+        for _, lock_state in self.locks.items():
+            if txn_id in lock_state.holders:
+                unblocked = lock_state.release_and_grant_next(txn_id)
+                all_unblocked.update(unblocked)
+
+        return list(all_unblocked)
 
 
 # Transaction Manager Simulator
