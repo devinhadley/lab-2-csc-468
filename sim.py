@@ -76,6 +76,11 @@ class LockManager:
 
     # I return true is txn acquires shared lock for item false otherwise and add it to queue.
     def acquire_shared_lock(self, txn_id: int, item: str) -> bool:
+        """
+        I return true if txn id already has a shared lock for item or if it is able to obtain it.
+        Othwerwise, I return false and add the transaction to the lock queue.
+        """
+
         # Can I acquire this lock?
         # Yes if:
         #   - No one has lock for this item.
@@ -103,6 +108,10 @@ class LockManager:
 
     # I return true is txn acquires exclusive lock for item false otherwise and add it to queue.
     def acquire_exclusive_lock(self, txn_id: int, item: str) -> bool:
+        """
+        I return true if txn id already has an exclusive lock for item or if it is able to obtain it.
+        Othwerwise, I return false and add the transaction to the lock queue.
+        """
         # Can I acquire this lock?
         # Yes if:
         #   - No one has lock for this item.
@@ -199,11 +208,46 @@ def parse_args():
     return args
 
 
-def main():
-    args = parse_args()
+def process_blocked_events(
+    pending_events: list[dict],
+    blocked_transactions: set[int],
+    lock_manager: LockManager,
+) -> list[dict]:
+    remaining_events = []
 
+    for event in pending_events:
+        if event["t"] in blocked_transactions:
+            remaining_events.append(event)
+            continue
+
+        match event:
+            case {"t": txn_id, "op": "BEGIN"}:
+                pass
+            case {"t": txn_id, "op": "COMMIT"} | {"t": txn_id, "op": "ABORT"}:
+                # Release all locks with txn_id...
+                unblocked_transactions = lock_manager.release_locks(txn_id)
+                blocked_transactions.difference_update(unblocked_transactions)
+
+            case {"t": txn_id, "op": "R", "item": item} as event:
+                if not lock_manager.acquire_shared_lock(txn_id, item):
+                    blocked_transactions.add(txn_id)  # idempotent...
+                    remaining_events.append(event)
+                    continue
+
+            case {"t": txn_id, "op": "W", "item": item} as event:
+                # Attempt to acquire the exclusive lock.
+                if not lock_manager.acquire_exclusive_lock(txn_id, item):
+                    blocked_transactions.add(txn_id)  # idempotent...
+                    remaining_events.append(event)
+                    continue
+
+    return remaining_events
+
+
+def two_phase_locking_sim(args):
     lock_manager = LockManager()
     blocked_transactions = set()
+    pending_events = []
 
     # Load the entire schedule in memory...
     schedule = []
@@ -211,42 +255,43 @@ def main():
         schedule = [json.loads(line) for line in f]
 
     for event in schedule:
+        if event["t"] in blocked_transactions:
+            pending_events.append(event)
+            continue
+
         match event:
             case {"t": txn_id, "op": "BEGIN"}:
                 pass
-            case {"t": txn_id, "op": "COMMIT"}:
+            case {"t": txn_id, "op": "COMMIT"} | {"t": txn_id, "op": "ABORT"}:
                 # Release all locks with txn_id...
-                pass
-            case {"t": txn_id, "op": "ABORT"}:
-                # Release all locks with txn_id...
-                lock_manager.release_locks(txn_id)
 
-                blocked_transactions.remove(69)
-                # TODO: Run any previous events that were blocked by this lock!
-                # That is, for all the transactions that now have the lock, rerun all possible events until blocked.
-                #
+                unblocked_transactions = lock_manager.release_locks(txn_id)
+                blocked_transactions.difference_update(unblocked_transactions)
 
-                pass
+                pending_events = process_blocked_events(
+                    pending_events, blocked_transactions, lock_manager
+                )
 
-            case {"t": txn_id, "op": "R", "item": item}:
-                if txn_id in blocked_transactions:
-                    continue
-
+            case {"t": txn_id, "op": "R", "item": item} as event:
                 if not lock_manager.acquire_shared_lock(txn_id, item):
-                    blocked_transactions.add(txn_id)
+                    blocked_transactions.add(txn_id)  # idempotent...
+                    pending_events.append(event)
                     continue
 
-                pass
-            case {"t": txn_id, "op": "W", "item": item}:
-                if txn_id in blocked_transactions:
-                    continue
-
-                # Acquire exlusive lock.
+            case {"t": txn_id, "op": "W", "item": item} as event:
+                # Attempt to acquire the exclusive lock.
                 if not lock_manager.acquire_exclusive_lock(txn_id, item):
                     blocked_transactions.add(txn_id)
+                    pending_events.append(event)
                     continue
+
             case _:
                 raise Exception(f"Uknown event format: {event}")
+
+
+def main():
+    args = parse_args()
+    two_phase_locking_sim(args)
 
 
 if __name__ == "__main__":
