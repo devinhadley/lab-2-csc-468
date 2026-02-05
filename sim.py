@@ -10,7 +10,7 @@ import logging
 
 
 from enum import Enum
-from collections import deque
+from collections import defaultdict, deque
 
 
 class LockMode(Enum):
@@ -34,9 +34,25 @@ class LockState:
     def is_queue_empty(self) -> bool:
         return len(self.queue) == 0
 
+    def add_to_blocked_queue(self, txn_id: int, lock_mode: LockMode):
+        self.queue.append((txn_id, lock_mode))
+
+    def get_wait_for_relationships(self) -> set[tuple[int, int]]:
+        """I return a set of edges (a,b) s.t. a is waiting for b to relesae lock for this item."""
+
+        edges = set()
+        for waiting_txn_id, _ in self.queue:
+            for holder_id in self.holders:
+                edges.add((waiting_txn_id, holder_id))
+
+        return edges
+
     # I remove the transaction from the current lock and update the state and next holder(s) accordingly.
     # I return which transactions are unblocked.
     def release_and_grant_next(self, txn_id) -> list[int]:
+        """
+        Given the current state, can the oldest queued request be granted now?
+        """
         if txn_id not in self.holders:
             print("Attempted to release lock for transaction which it didn't hold.")
             return []
@@ -63,9 +79,24 @@ class LockState:
             # If none pop the next element and set the mode to the request mode.
             elif self.lock_mode == LockMode.NONE:
                 txn_id, mode = self.queue.popleft()
-                self.lock_mode = mode
+                self.set_lock_mode(mode)
                 self.holders.add(txn_id)
                 unblocked.append(txn_id)
+            elif (
+                self.lock_mode == LockMode.SHARED
+                and self.queue[0][1] == LockMode.EXCLUSIVE
+            ):
+                # TODO: If a transaction blocks on a lock request, that operation (and all subsequent ops in the transaction)
+                # must wait; when other holders release, a queued X request from the same txn must be granted immediately
+                # once it is the sole remaining holder, or the transaction can deadlock waiting on itself.
+                # That is, handle upgrade!
+                next_txn, _ = self.queue[0]
+                if self.holders == {next_txn}:
+                    self.queue.popleft()
+                    self.set_lock_mode(LockMode.EXCLUSIVE)
+                    unblocked.append(next_txn)
+                else:
+                    break
 
         return unblocked
 
@@ -79,6 +110,7 @@ class LockManager:
         """
         I return true if txn id already has a shared lock for item or if it is able to obtain it.
         Othwerwise, I return false and add the transaction to the lock queue.
+        Given the current state, can this request be granted immediately?
         """
 
         # Can I acquire this lock?
@@ -99,7 +131,7 @@ class LockManager:
         if current_lock_state.lock_mode == LockMode.EXCLUSIVE or (
             not current_lock_state.is_queue_empty()
         ):
-            self.locks[item].queue.append((txn_id, LockMode.SHARED))
+            self.locks[item].add_to_blocked_queue(txn_id, LockMode.SHARED)
             return False
 
         current_lock_state.set_lock_mode(LockMode.SHARED)
@@ -111,6 +143,7 @@ class LockManager:
         """
         I return true if txn id already has an exclusive lock for item or if it is able to obtain it.
         Othwerwise, I return false and add the transaction to the lock queue.
+        Given the current state, can this request be granted immediately?
         """
         # Can I acquire this lock?
         # Yes if:
@@ -134,7 +167,7 @@ class LockManager:
         ):
             # Cannot upgrade if other locks are waiting for exclusive.
             if not current_lock_state.is_queue_empty():
-                current_lock_state.queue.append((txn_id, LockMode.EXCLUSIVE))
+                self.locks[item].add_to_blocked_queue(txn_id, LockMode.EXCLUSIVE)
                 return False
 
             # Can upgrade only if we're the sole holder
@@ -143,7 +176,7 @@ class LockManager:
                 return True
             else:
                 # Other transactions also hold S, must wait
-                current_lock_state.queue.append((txn_id, LockMode.EXCLUSIVE))
+                self.locks[item].add_to_blocked_queue(txn_id, LockMode.EXCLUSIVE)
                 return False
 
         # Not already a holder, can we become exclusive holder?
@@ -151,7 +184,7 @@ class LockManager:
         if current_lock_state.lock_mode != LockMode.NONE or (
             not current_lock_state.is_queue_empty()
         ):
-            self.locks[item].queue.append((txn_id, LockMode.EXCLUSIVE))
+            self.locks[item].add_to_blocked_queue(txn_id, LockMode.EXCLUSIVE)
             return False
 
         # Otherwise, we are the first to acquire this lock.
@@ -163,12 +196,53 @@ class LockManager:
     # I return a list of newly unbloked transactions if any.
     def release_locks(self, txn_id: int) -> list[int]:
         all_unblocked = set()
+
         for _, lock_state in self.locks.items():
             if txn_id in lock_state.holders:
                 unblocked = lock_state.release_and_grant_next(txn_id)
                 all_unblocked.update(unblocked)
 
         return list(all_unblocked)
+
+    def is_deadlock(self) -> bool:
+        adj_list = defaultdict(set)
+        for _, lock_state in self.locks.items():
+            edges = lock_state.get_wait_for_relationships()
+            for waiting_txn, holding_txn in edges:
+                adj_list[waiting_txn].add(holding_txn)
+
+        # DFS but return true if cycle detected.
+        visiting = set()
+        visited = set()
+
+        # Does there exist a path that starts and ends on the same vertex in adj list?
+        def dfs(txn_id: int) -> bool:
+            visited.add(txn_id)
+            visiting.add(txn_id)
+
+            neighbors = adj_list.get(txn_id, [])  # leaf node if []
+
+            for neighbor in neighbors:
+                if neighbor in visiting:
+                    return True
+
+                if neighbor in visited:
+                    continue
+
+                if dfs(neighbor):
+                    return True
+
+            visiting.remove(txn_id)
+            return False
+
+        for (
+            txn_id
+        ) in adj_list:  # default dict may add keys when accessing txns not in adj list.
+            if txn_id not in visited:
+                if dfs(txn_id):
+                    return True
+
+        return False
 
 
 # Transaction Manager Simulator
@@ -276,6 +350,11 @@ def two_phase_locking_sim(args):
                 if not lock_manager.acquire_shared_lock(txn_id, item):
                     blocked_transactions.add(txn_id)  # idempotent...
                     pending_events.append(event)
+
+                    if lock_manager.is_deadlock():
+                        # TODO: Abort transaction with largest id!
+                        print("Deadlock!")
+
                     continue
 
             case {"t": txn_id, "op": "W", "item": item} as event:
@@ -283,6 +362,11 @@ def two_phase_locking_sim(args):
                 if not lock_manager.acquire_exclusive_lock(txn_id, item):
                     blocked_transactions.add(txn_id)
                     pending_events.append(event)
+
+                    if lock_manager.is_deadlock():
+                        # TODO: Abort transaction with largest id!
+                        print("Deadlock!")
+
                     continue
 
             case _:
