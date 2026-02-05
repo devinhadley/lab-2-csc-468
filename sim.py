@@ -204,6 +204,22 @@ class LockManager:
 
         return list(all_unblocked)
 
+    # I release the lock and wait queues for any items this txn was a holder for.
+    def clear_transaction_from_lock_table(self, txn_id: int) -> list[int]:
+        unblocked = self.release_locks(txn_id)
+
+        # Note that transaction can only be waiting on one lock at a time (blocked).
+        # Remove from queue txn is in any
+        for _, lock_state in self.locks.items():
+            queue = deque([req for req in lock_state.queue if req[0] != txn_id])
+
+            # txn was filtered out of this queue.
+            if len(queue) < len(lock_state.queue):
+                lock_state.queue = queue
+                return unblocked
+
+        return unblocked
+
     def is_deadlock(self) -> bool:
         adj_list = defaultdict(set)
         for _, lock_state in self.locks.items():
@@ -219,6 +235,7 @@ class LockManager:
         def dfs(txn_id: int) -> bool:
             visited.add(txn_id)
             visiting.add(txn_id)
+            # TODO: look at last element and find the previous index in visiting use this range to find victim.
 
             neighbors = adj_list.get(txn_id, [])  # leaf node if []
 
@@ -306,6 +323,11 @@ def process_blocked_events(
                 if not lock_manager.acquire_shared_lock(txn_id, item):
                     blocked_transactions.add(txn_id)  # idempotent...
                     remaining_events.append(event)
+
+                    if lock_manager.is_deadlock():
+                        # TODO: Abort transaction with largest id!
+                        print("Deadlock!")
+
                     continue
 
             case {"t": txn_id, "op": "W", "item": item} as event:
@@ -313,6 +335,11 @@ def process_blocked_events(
                 if not lock_manager.acquire_exclusive_lock(txn_id, item):
                     blocked_transactions.add(txn_id)  # idempotent...
                     remaining_events.append(event)
+
+                    if lock_manager.is_deadlock():
+                        # TODO: Abort transaction with largest id!
+                        print("Deadlock!")
+
                     continue
 
     return remaining_events
@@ -337,7 +364,8 @@ def two_phase_locking_sim(args):
             case {"t": txn_id, "op": "BEGIN"}:
                 pass
             case {"t": txn_id, "op": "COMMIT"} | {"t": txn_id, "op": "ABORT"}:
-                # Release all locks with txn_id...
+                # Note that if we reach this, the transaction is not currently blocked.
+                # Therefore no need to remove from lock queues.
 
                 unblocked_transactions = lock_manager.release_locks(txn_id)
                 blocked_transactions.difference_update(unblocked_transactions)
@@ -366,6 +394,7 @@ def two_phase_locking_sim(args):
                     if lock_manager.is_deadlock():
                         # TODO: Abort transaction with largest id!
                         print("Deadlock!")
+                        lock_manager.clear_transaction_from_lock_table()
 
                     continue
 
