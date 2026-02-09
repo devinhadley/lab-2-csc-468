@@ -1,16 +1,12 @@
-import collections
 import argparse
 from enum import Enum
 import os
 import json
-import logging
+from collections import defaultdict, deque
+from util import Tracer
 
 
 # Strict Two Phase Locking
-
-
-from enum import Enum
-from collections import defaultdict, deque
 
 
 class LockMode(Enum):
@@ -102,8 +98,9 @@ class LockState:
 
 
 class LockManager:
-    def __init__(self) -> None:
+    def __init__(self, tracer: Tracer) -> None:
         self.locks: dict[str, LockState] = {}  # maps an item to its LockState
+        self.tracer = tracer
 
     # I return true is txn acquires shared lock for item false otherwise and add it to queue.
     def acquire_shared_lock(self, txn_id: int, item: str) -> bool:
@@ -136,6 +133,7 @@ class LockManager:
 
         current_lock_state.set_lock_mode(LockMode.SHARED)
         current_lock_state.add_holder(txn_id)
+        self.tracer.emit({"event": "LOCK", "item": item, "grant": "S", "to": txn_id})
         return True
 
     # I return true is txn acquires exclusive lock for item false otherwise and add it to queue.
@@ -173,6 +171,9 @@ class LockManager:
             # Can upgrade only if we're the sole holder
             if len(current_lock_state.holders) == 1:
                 current_lock_state.set_lock_mode(LockMode.EXCLUSIVE)
+                self.tracer.emit(
+                    {"event": "LOCK", "item": item, "grant": "X", "to": txn_id}
+                )
                 return True
             else:
                 # Other transactions also hold S, must wait
@@ -190,6 +191,7 @@ class LockManager:
         # Otherwise, we are the first to acquire this lock.
         current_lock_state.set_lock_mode(LockMode.EXCLUSIVE)
         current_lock_state.add_holder(txn_id)
+        self.tracer.emit({"event": "LOCK", "item": item, "grant": "X", "to": txn_id})
         return True
 
     # I release the lock for any items this txn was a holder for.
@@ -220,46 +222,53 @@ class LockManager:
 
         return unblocked
 
-    def is_deadlock(self) -> bool:
+    def get_deadlock_victim_id(self) -> int | None:
+        """I return the victim (transaction) id if there is a  lock dependency cycle otherwise, None"""
         adj_list = defaultdict(set)
         for _, lock_state in self.locks.items():
             edges = lock_state.get_wait_for_relationships()
             for waiting_txn, holding_txn in edges:
                 adj_list[waiting_txn].add(holding_txn)
 
-        # DFS but return true if cycle detected.
+        # DFS but return highest txn id in a detected cycle.
         visiting = set()
         visited = set()
+        stack = []
 
         # Does there exist a path that starts and ends on the same vertex in adj list?
-        def dfs(txn_id: int) -> bool:
+        def dfs(txn_id: int) -> int | None:
             visited.add(txn_id)
             visiting.add(txn_id)
-            # TODO: look at last element and find the previous index in visiting use this range to find victim.
+            stack.append(txn_id)
+            try:
+                neighbors = adj_list.get(txn_id, [])  # leaf node if []
 
-            neighbors = adj_list.get(txn_id, [])  # leaf node if []
+                for neighbor in neighbors:
+                    if neighbor in visiting:
+                        cycle_start_index = stack.index(neighbor)
+                        return max(stack[cycle_start_index:])
 
-            for neighbor in neighbors:
-                if neighbor in visiting:
-                    return True
+                    if neighbor in visited:
+                        continue
 
-                if neighbor in visited:
-                    continue
+                    cycle_max = dfs(neighbor)
+                    if cycle_max is not None:
+                        return cycle_max
 
-                if dfs(neighbor):
-                    return True
-
-            visiting.remove(txn_id)
-            return False
+                return None
+            finally:
+                visiting.remove(txn_id)
+                stack.pop()
 
         for (
             txn_id
         ) in adj_list:  # default dict may add keys when accessing txns not in adj list.
             if txn_id not in visited:
-                if dfs(txn_id):
-                    return True
+                cycle_max = dfs(txn_id)
+                if cycle_max is not None:
+                    return cycle_max
 
-        return False
+        return None
 
 
 # Transaction Manager Simulator
@@ -299,12 +308,60 @@ def parse_args():
     return args
 
 
+def handle_blocked_lock_request(
+    txn_id: int,
+    event: dict,
+    blocked_transactions: set[int],
+    pending_events: list[dict],
+    lock_manager: LockManager,
+) -> int | None:
+    blocked_transactions.add(txn_id)  # idempotent...
+    pending_events.append(event)
+
+    victim_id = lock_manager.get_deadlock_victim_id()
+
+    return victim_id
+
+
+def abort_deadlock_victim_if_exists(
+    victim_id: int | None,
+    blocked_transactions: set[int],
+    pending_events: list[dict],
+    transaction_buffers: dict[int, dict],
+    tracer: Tracer,
+    lock_manager: LockManager,
+) -> list[dict]:
+    if victim_id is None:
+        return pending_events
+
+    lock_manager.clear_transaction_from_lock_table(victim_id)
+    blocked_transactions.discard(victim_id)
+    pending_events = [
+        pending_event
+        for pending_event in pending_events
+        if pending_event["t"] != victim_id
+    ]
+
+    if victim_id in transaction_buffers:
+        del transaction_buffers[victim_id]
+
+    tracer.emit({"event": "ABORT", "t": victim_id})
+
+    return pending_events
+
+
 def process_blocked_events(
     pending_events: list[dict],
     blocked_transactions: set[int],
     lock_manager: LockManager,
+    transaction_buffers: dict[int, dict],
+    tracer: Tracer,
+    db: dict,
 ) -> list[dict]:
     remaining_events = []
+
+    # TODO: Handle when locks are released when handling blocked events.
+    # Iterate through pending, and if COMMIT or ABORT or kill cycle (abort) then start again from front.
 
     for event in pending_events:
         if event["t"] in blocked_transactions:
@@ -321,39 +378,65 @@ def process_blocked_events(
 
             case {"t": txn_id, "op": "R", "item": item} as event:
                 if not lock_manager.acquire_shared_lock(txn_id, item):
-                    blocked_transactions.add(txn_id)  # idempotent...
-                    remaining_events.append(event)
-
-                    if lock_manager.is_deadlock():
-                        # TODO: Abort transaction with largest id!
-                        print("Deadlock!")
-
+                    handle_blocked_lock_request(
+                        txn_id,
+                        event,
+                        blocked_transactions,
+                        remaining_events,
+                        lock_manager,
+                    )
                     continue
 
-            case {"t": txn_id, "op": "W", "item": item} as event:
+                # This was unblocked by some release!
+                tracer.emit({"event": "UNBLOCK", "t": txn_id, "item": item})
+
+                val = transaction_buffers[txn_id].get(item, db.get(item))
+                tracer.emit(
+                    {
+                        "event": "OP",
+                        "t": txn_id,
+                        "op": "R",
+                        "item": item,
+                        "result": "OK",
+                        "value": val,
+                    }
+                )
+
+            case {"t": txn_id, "op": "W", "item": item, "value": value} as event:
                 # Attempt to acquire the exclusive lock.
                 if not lock_manager.acquire_exclusive_lock(txn_id, item):
-                    blocked_transactions.add(txn_id)  # idempotent...
-                    remaining_events.append(event)
-
-                    if lock_manager.is_deadlock():
-                        # TODO: Abort transaction with largest id!
-                        print("Deadlock!")
-
+                    handle_blocked_lock_request(
+                        txn_id,
+                        event,
+                        blocked_transactions,
+                        remaining_events,
+                        lock_manager,
+                    )
                     continue
+
+                # This was unblocked by some release!
+                tracer.emit({"event": "UNBLOCK", "t": txn_id, "item": item})
+
+                transaction_buffers[txn_id][item] = value
+                tracer.emit(
+                    {
+                        "event": "OP",
+                        "t": txn_id,
+                        "op": "W",
+                        "item": item,
+                        "result": "OK",
+                        "value": value,
+                    }
+                )
 
     return remaining_events
 
 
-def two_phase_locking_sim(args):
-    lock_manager = LockManager()
+def two_phase_locking_sim(schedule: list[dict], tracer: Tracer, db: dict):
+    lock_manager = LockManager(tracer)
     blocked_transactions = set()
     pending_events = []
-
-    # Load the entire schedule in memory...
-    schedule = []
-    with open(args.schedule, "r") as f:
-        schedule = [json.loads(line) for line in f]
+    transaction_buffers = defaultdict(dict)
 
     for event in schedule:
         if event["t"] in blocked_transactions:
@@ -362,39 +445,135 @@ def two_phase_locking_sim(args):
 
         match event:
             case {"t": txn_id, "op": "BEGIN"}:
-                pass
-            case {"t": txn_id, "op": "COMMIT"} | {"t": txn_id, "op": "ABORT"}:
+                tracer.emit({"event": "OP", "t": txn_id, "op": "BEGIN", "result": "OK"})
+
+            case {"t": txn_id, "op": "COMMIT"} | {"t": txn_id, "op": "ABORT"} as event:
                 # Note that if we reach this, the transaction is not currently blocked.
                 # Therefore no need to remove from lock queues.
 
                 unblocked_transactions = lock_manager.release_locks(txn_id)
+
                 blocked_transactions.difference_update(unblocked_transactions)
 
                 pending_events = process_blocked_events(
-                    pending_events, blocked_transactions, lock_manager
+                    pending_events,
+                    blocked_transactions,
+                    lock_manager,
+                    transaction_buffers,
+                    tracer,
+                    db,
                 )
+                op = event["op"]
+                if op == "COMMIT":
+                    tracer.emit(
+                        {"event": "OP", "t": txn_id, "op": "COMMIT", "result": "OK"}
+                    )
+
+                    # Write to db...
+                    for item, val in transaction_buffers[txn_id].items():
+                        db[item] = val
+                    del transaction_buffers[txn_id]
+
+                else:
+                    tracer.emit(
+                        {
+                            "event": "OP",
+                            "t": txn_id,
+                            "op": "ABORT",
+                            "result": "OK",
+                        }
+                    )
+                    del transaction_buffers[txn_id]
 
             case {"t": txn_id, "op": "R", "item": item} as event:
-                if not lock_manager.acquire_shared_lock(txn_id, item):
-                    blocked_transactions.add(txn_id)  # idempotent...
-                    pending_events.append(event)
+                if lock_manager.acquire_shared_lock(txn_id, item):
+                    # We have at least shared lock for item, it is safe to read...
+                    val = transaction_buffers[txn_id].get(item, db.get(item))
+                    tracer.emit(
+                        {
+                            "event": "OP",
+                            "t": txn_id,
+                            "op": "R",
+                            "item": item,
+                            "result": "OK",
+                            "value": val,
+                        }
+                    )
+                else:
+                    tracer.emit(
+                        {
+                            "event": "OP",
+                            "t": txn_id,
+                            "op": "R",
+                            "item": item,
+                            "result": "BLOCKED",
+                            "why": f"waiting for S({item})",
+                        }
+                    )
 
-                    if lock_manager.is_deadlock():
-                        # TODO: Abort transaction with largest id!
-                        print("Deadlock!")
+                    victim_id = handle_blocked_lock_request(
+                        txn_id,
+                        event,
+                        blocked_transactions,
+                        pending_events,
+                        lock_manager,
+                    )
+
+                    pending_events = abort_deadlock_victim_if_exists(
+                        victim_id,
+                        blocked_transactions,
+                        pending_events,
+                        transaction_buffers,
+                        tracer,
+                        lock_manager,
+                    )
 
                     continue
 
-            case {"t": txn_id, "op": "W", "item": item} as event:
+            case {"t": txn_id, "op": "W", "item": item, "value": value} as event:
                 # Attempt to acquire the exclusive lock.
-                if not lock_manager.acquire_exclusive_lock(txn_id, item):
-                    blocked_transactions.add(txn_id)
-                    pending_events.append(event)
+                if lock_manager.acquire_exclusive_lock(txn_id, item):
+                    # We have exclusive lock for item, it is safe to write...
+                    transaction_buffers[txn_id][item] = value
 
-                    if lock_manager.is_deadlock():
-                        # TODO: Abort transaction with largest id!
-                        print("Deadlock!")
-                        lock_manager.clear_transaction_from_lock_table()
+                    tracer.emit(
+                        {
+                            "event": "OP",
+                            "t": txn_id,
+                            "op": "W",
+                            "item": item,
+                            "value": value,
+                            "result": "OK",
+                        }
+                    )
+                else:
+                    tracer.emit(
+                        {
+                            "event": "OP",
+                            "t": txn_id,
+                            "op": "W",
+                            "item": item,
+                            "result": "BLOCKED",
+                            "why": f"waiting for X({item})",
+                        }
+                    )
+
+                    victim_id = handle_blocked_lock_request(
+                        txn_id,
+                        event,
+                        blocked_transactions,
+                        pending_events,
+                        lock_manager,
+                    )
+
+                    pending_events = abort_deadlock_victim_if_exists(
+                        victim_id,
+                        blocked_transactions,
+                        pending_events,
+                        transaction_buffers,
+                        tracer,
+                        lock_manager,
+                    )
 
                     continue
 
@@ -402,9 +581,23 @@ def two_phase_locking_sim(args):
                 raise Exception(f"Uknown event format: {event}")
 
 
+def load_schedule(path):
+    with open(path, "r") as file:
+        return [json.loads(line) for line in file]
+
+
+def load_db():
+    db_path = os.path.join(os.path.dirname(__file__), "files", "db", "db.json")
+    with open(db_path, "r") as db_file:
+        return json.load(db_file)
+
+
 def main():
     args = parse_args()
-    two_phase_locking_sim(args)
+    schedule = load_schedule(args.schedule)
+    db = load_db()
+    with Tracer(args.out) as tracer:
+        two_phase_locking_sim(schedule, tracer, db)
 
 
 if __name__ == "__main__":
