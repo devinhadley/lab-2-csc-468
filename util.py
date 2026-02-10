@@ -4,7 +4,6 @@ import os
 
 class Tracer:
     def __init__(self, out_dir, filename="trace.jsonl", debug=False):
-        os.makedirs(out_dir, exist_ok=True)
         self.path = os.path.join(out_dir, filename)
         self.f = open(self.path, "w")
         self.step = 0

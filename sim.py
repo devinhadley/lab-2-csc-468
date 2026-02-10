@@ -42,8 +42,24 @@ def parse_args():
     return args
 
 
-def mvcc_sim(schedule: list[dict], tracer: Tracer, db: dict):
-    transaction_buffer = defaultdict(dict)
+def mvcc_sim(schedule: list[dict[str, list]], tracer: Tracer, db: dict):
+    # txn -> item -> list of (value, creation, expiration)
+
+    # Each transaction reads from a snapshot.
+    # Snapshot is defined when the transaction starts.
+    # So esentially, for the entirety of the transaction
+    # it only reads data which was matching the state of when it started.
+
+    # Reads only see:
+    #   - Only versions commited before the snapshot.
+    #   - A consistent view of the database.
+    #   - Esentially a frozen picture of the database.
+    #   - V.commit_ts ≤ T.snapshot_ts
+
+    # Transaction cant commit if:
+    #   - It writes to an item who was already written to during its lifetime.
+
+    transaction_buffer = defaultdict(lambda: defaultdict(list))
 
     for event in schedule:
         match event:
@@ -88,6 +104,11 @@ def main():
         if args.cc == "2pl":
             two_phase_locking_sim(schedule, tracer, db)
         elif args.cc == "mvcc":
+            # transform the DB into a verisioned DB for MVCC.
+            db = {
+                item: [{"val": val, "begin": 0, "end": float("inf"), "txn": None}]
+                for item, val in db.items()
+            }
             mvcc_sim(schedule, tracer, db)
         else:
             print(f"Unknown concurrency model: {args.cc}")
