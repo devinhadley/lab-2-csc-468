@@ -42,7 +42,54 @@ def parse_args():
     return args
 
 
-def mvcc_sim(schedule: list[dict[str, list]], tracer: Tracer, db: dict):
+# item -> [(value, start_time, end_time)] # float is to allow for infinity...
+DBWithVersionHistory = dict[str, list[tuple[int, int, float]]]
+
+
+def get_latest_value_committed_before_snapshot(
+    db: DBWithVersionHistory, start_timestamp: int, item: str
+) -> int:
+    for val, begin, end in reversed(db[item]):
+        if begin <= start_timestamp < end:
+            return val
+
+    raise Exception("No versioned value for " + item)
+
+
+def get_latest_value_start_time(db: DBWithVersionHistory, item: str) -> int:
+    values = db[item]
+
+    if len(values) == 0:
+        raise Exception("No versioned value for " + item)
+
+    return values[-1][1]
+
+
+def write_new_value(
+    db: DBWithVersionHistory,
+    clock_time: int,
+    item: str,
+    new_value: int,
+):
+    values = db[item]
+    last_val, last_begin, _ = values[-1]
+
+    previous_val = (last_val, last_begin, clock_time)
+    values[-1] = previous_val
+
+    values.append((new_value, clock_time, float("inf")))
+
+
+def cleanup_transaction(
+    transaction_buffers: dict[int, dict],
+    transaction_starts: dict[int, int],
+    txn_id: int,
+) -> None:
+    del transaction_buffers[txn_id]
+    del transaction_starts[txn_id]
+
+
+def mvcc_sim(schedule: list[dict], tracer: Tracer, db: DBWithVersionHistory):
     # txn -> item -> list of (value, creation, expiration)
 
     # Each transaction reads from a snapshot.
@@ -59,24 +106,91 @@ def mvcc_sim(schedule: list[dict[str, list]], tracer: Tracer, db: dict):
     # Transaction cant commit if:
     #   - It writes to an item who was already written to during its lifetime.
 
-    transaction_buffer = defaultdict(lambda: defaultdict(list))
+    transaction_buffers: dict[
+        int, dict
+    ] = {}  # txn -> item -> value (prevent dirty reads...)
+    transaction_starts: dict[int, int] = {}  # txn -> start_time
+    clock = 0  # every commit the clock increments by one.
 
     for event in schedule:
         match event:
             case {"t": txn_id, "op": "BEGIN"}:
-                pass
+                transaction_buffers[txn_id] = {}
+                transaction_starts[txn_id] = clock
+                tracer.emit({"event": "OP", "t": txn_id, "op": "BEGIN", "result": "OK"})
 
             case {"t": txn_id, "op": "COMMIT"}:
-                pass
+                # LatestVersion.begin_ts > MyTransaction.start_ts ⟹ ABORT
+
+                # All or nothing!
+                should_abort = False
+                for item in transaction_buffers[txn_id]:
+                    latest_version_begin_timestamp = get_latest_value_start_time(
+                        db, item
+                    )
+
+                    # We're overwriting a state we never even saw... ABORT!
+                    if latest_version_begin_timestamp > transaction_starts[txn_id]:
+                        tracer.emit({"event": "ABORT", "t": txn_id})
+                        cleanup_transaction(
+                            transaction_buffers, transaction_starts, txn_id
+                        )
+                        should_abort = True
+                        break
+
+                if should_abort:
+                    continue
+
+                for item, value in transaction_buffers[txn_id].items():
+                    write_new_value(db, clock, item, value)
+
+                tracer.emit(
+                    {"event": "OP", "t": txn_id, "op": "COMMIT", "result": "OK"}
+                )
+
+                # Cleanup
+                cleanup_transaction(transaction_buffers, transaction_starts, txn_id)
 
             case {"t": txn_id, "op": "ABORT"}:
-                pass
+                tracer.emit({"event": "OP", "t": txn_id, "op": "ABORT", "result": "OK"})
+                cleanup_transaction(transaction_buffers, transaction_starts, txn_id)
 
             case {"t": txn_id, "op": "R", "item": item} as event:
-                pass
+                val = transaction_buffers[txn_id].get(item)
 
-            case {"t": txn_id, "op": "W", "item": item, "value": value} as event:
-                pass
+                # 2. If it's not in the buffer (None), fall back to the snapshot logic
+                if val is None:
+                    # Note: Your helper returns a tuple (val, begin, end)
+                    val = get_latest_value_committed_before_snapshot(
+                        # We only need the value for the read result.
+                        db,
+                        transaction_starts[txn_id],
+                        item,
+                    )
+
+                tracer.emit(
+                    {
+                        "event": "OP",
+                        "t": txn_id,
+                        "op": "R",
+                        "item": item,
+                        "result": "OK",
+                        "value": val,
+                    }
+                )
+
+            case {"t": txn_id, "op": "W", "item": item, "value": val} as event:
+                transaction_buffers[txn_id][item] = val
+                tracer.emit(
+                    {
+                        "event": "OP",
+                        "t": txn_id,
+                        "op": "W",
+                        "item": item,
+                        "result": "OK",
+                        "value": val,
+                    }
+                )
 
             case _:
                 raise Exception(f"Uknown event format: {event}")
@@ -105,13 +219,14 @@ def main():
             two_phase_locking_sim(schedule, tracer, db)
         elif args.cc == "mvcc":
             # transform the DB into a verisioned DB for MVCC.
-            db = {
-                item: [{"val": val, "begin": 0, "end": float("inf"), "txn": None}]
-                for item, val in db.items()
-            }
+            db = {item: [(val, 0, float("inf"))] for item, val in db.items()}
             mvcc_sim(schedule, tracer, db)
         else:
             print(f"Unknown concurrency model: {args.cc}")
+
+    if args.cc == "mvcc":
+        # Extract only the value from the latest version of each item
+        db = {item: versions[-1][0] for item, versions in db.items()}
 
     db_out_path = os.path.join(args.out, "db.json")
     with open(db_out_path, "w") as out_db_file:
