@@ -246,7 +246,18 @@ class LockManager:
                 for neighbor in neighbors:
                     if neighbor in visiting:
                         cycle_start_index = stack.index(neighbor)
-                        return max(stack[cycle_start_index:])
+
+                        victim_id = max(stack[cycle_start_index:])
+
+                        self.tracer.emit(
+                            {
+                                "event": "DEADLOCK",
+                                "cycle": stack + [victim_id],
+                                "victim": victim_id,
+                            }
+                        )
+
+                        return victim_id
 
                     if neighbor in visited:
                         continue
@@ -323,9 +334,10 @@ def handle_blocked_lock_request(
     return victim_id
 
 
-def abort_deadlock_victim_if_exists(
+def abort_deadlock_victim(
     victim_id: int | None,
     blocked_transactions: set[int],
+    aborted_transactions: set[int],
     pending_events: list[dict],
     transaction_buffers: dict[int, dict],
     tracer: Tracer,
@@ -334,8 +346,13 @@ def abort_deadlock_victim_if_exists(
     if victim_id is None:
         return pending_events
 
-    lock_manager.clear_transaction_from_lock_table(victim_id)
+    newly_unblocked = lock_manager.clear_transaction_from_lock_table(victim_id)
+    blocked_transactions.difference_update(
+        newly_unblocked
+    )  # unblock any transactions that acquired locks.
     blocked_transactions.discard(victim_id)
+    aborted_transactions.add(victim_id)
+
     pending_events = [
         pending_event
         for pending_event in pending_events
@@ -350,13 +367,24 @@ def abort_deadlock_victim_if_exists(
     return pending_events
 
 
+# NOTE: Run me anytime the lock state changes (Any other transaction is commited or aborted)!
 def process_blocked_events(
-    pending_events, blocked_transactions, lock_manager, transaction_buffers, tracer, db
+    pending_events,
+    blocked_transactions,
+    aborted_transactions,
+    lock_manager,
+    transaction_buffers,
+    tracer,
+    db,
 ):
     i = 0
     while i < len(pending_events):
         event = pending_events[i]
         txn_id = event["t"]
+
+        if txn_id in aborted_transactions:
+            pending_events.pop(i)
+            continue
 
         # If they are still explicitly blocked by something else, move to next
         if txn_id in blocked_transactions:
@@ -364,6 +392,35 @@ def process_blocked_events(
             continue
 
         match event:
+            case {"op": "COMMIT"}:
+                for item, val in transaction_buffers[txn_id].items():
+                    db[item] = val
+
+                unblocked = lock_manager.release_locks(txn_id)
+                blocked_transactions.difference_update(unblocked)
+
+                tracer.emit(
+                    {"event": "OP", "t": txn_id, "op": "COMMIT", "result": "OK"}
+                )
+                del transaction_buffers[txn_id]
+                pending_events.pop(i)
+
+                i = 0
+                continue
+
+            case {"op": "ABORT"}:
+                unblocked = lock_manager.clear_transaction_from_lock_table(txn_id)
+                blocked_transactions.difference_update(unblocked)
+                aborted_transactions.add(txn_id)
+
+                tracer.emit({"event": "OP", "t": txn_id, "op": "ABORT", "result": "OK"})
+                if txn_id in transaction_buffers:
+                    del transaction_buffers[txn_id]
+                pending_events.pop(i)
+
+                i = 0
+                continue
+
             case {"op": "R", "item": item}:
                 if lock_manager.acquire_shared_lock(txn_id, item):
                     tracer.emit({"event": "UNBLOCK", "t": txn_id, "item": item})
@@ -380,7 +437,6 @@ def process_blocked_events(
                     )
 
                     pending_events.pop(i)
-                    i = 0  # RESTART: Newer locks might have unblocked older requests
                     continue
                 else:
                     victim_id = handle_blocked_lock_request(
@@ -388,9 +444,10 @@ def process_blocked_events(
                     )
                     if victim_id is not None:
                         # Deadlock! Abort victim, release their locks, and RESTART
-                        pending_events = abort_deadlock_victim_if_exists(
+                        pending_events = abort_deadlock_victim(
                             victim_id,
                             blocked_transactions,
+                            aborted_transactions,
                             pending_events,
                             transaction_buffers,
                             tracer,
@@ -415,16 +472,16 @@ def process_blocked_events(
                     )
 
                     pending_events.pop(i)
-                    i = 0  # RESTART
                     continue
                 else:
                     victim_id = handle_blocked_lock_request(
                         txn_id, event, blocked_transactions, [], lock_manager
                     )
                     if victim_id is not None:
-                        pending_events = abort_deadlock_victim_if_exists(
+                        pending_events = abort_deadlock_victim(
                             victim_id,
                             blocked_transactions,
+                            aborted_transactions,
                             pending_events,
                             transaction_buffers,
                             tracer,
@@ -439,10 +496,13 @@ def process_blocked_events(
 def two_phase_locking_sim(schedule: list[dict], tracer: Tracer, db: dict):
     lock_manager = LockManager(tracer)
     blocked_transactions = set()
+    aborted_transactions = set()
     pending_events = []
     transaction_buffers = defaultdict(dict)
 
     for event in schedule:
+        if event["t"] in aborted_transactions:
+            continue
         if event["t"] in blocked_transactions:
             pending_events.append(event)
             continue
@@ -451,7 +511,7 @@ def two_phase_locking_sim(schedule: list[dict], tracer: Tracer, db: dict):
             case {"t": txn_id, "op": "BEGIN"}:
                 tracer.emit({"event": "OP", "t": txn_id, "op": "BEGIN", "result": "OK"})
 
-            case {"t": txn_id, "op": "COMMIT"} | {"t": txn_id, "op": "ABORT"} as event:
+            case {"t": txn_id, "op": "COMMIT"}:
                 # Note that if we reach this, the transaction is not currently blocked.
                 # Therefore no need to remove from lock queues.
 
@@ -462,32 +522,47 @@ def two_phase_locking_sim(schedule: list[dict], tracer: Tracer, db: dict):
                 pending_events = process_blocked_events(
                     pending_events,
                     blocked_transactions,
+                    aborted_transactions,
                     lock_manager,
                     transaction_buffers,
                     tracer,
                     db,
                 )
-                op = event["op"]
-                if op == "COMMIT":
-                    tracer.emit(
-                        {"event": "OP", "t": txn_id, "op": "COMMIT", "result": "OK"}
-                    )
+                tracer.emit(
+                    {"event": "OP", "t": txn_id, "op": "COMMIT", "result": "OK"}
+                )
 
-                    # Write to db...
-                    for item, val in transaction_buffers[txn_id].items():
-                        db[item] = val
-                    del transaction_buffers[txn_id]
+                for item, val in transaction_buffers[txn_id].items():
+                    db[item] = val
+                del transaction_buffers[txn_id]
 
-                else:
-                    tracer.emit(
-                        {
-                            "event": "OP",
-                            "t": txn_id,
-                            "op": "ABORT",
-                            "result": "OK",
-                        }
-                    )
-                    del transaction_buffers[txn_id]
+            case {"t": txn_id, "op": "ABORT"}:
+                # Note that if we reach this, the transaction is not currently blocked.
+                # Therefore no need to remove from lock queues.
+
+                unblocked_transactions = lock_manager.release_locks(txn_id)
+
+                blocked_transactions.difference_update(unblocked_transactions)
+
+                pending_events = process_blocked_events(
+                    pending_events,
+                    blocked_transactions,
+                    aborted_transactions,
+                    lock_manager,
+                    transaction_buffers,
+                    tracer,
+                    db,
+                )
+                tracer.emit(
+                    {
+                        "event": "OP",
+                        "t": txn_id,
+                        "op": "ABORT",
+                        "result": "OK",
+                    }
+                )
+                aborted_transactions.add(txn_id)
+                del transaction_buffers[txn_id]
 
             case {"t": txn_id, "op": "R", "item": item} as event:
                 if lock_manager.acquire_shared_lock(txn_id, item):
@@ -523,14 +598,27 @@ def two_phase_locking_sim(schedule: list[dict], tracer: Tracer, db: dict):
                         lock_manager,
                     )
 
-                    pending_events = abort_deadlock_victim_if_exists(
-                        victim_id,
-                        blocked_transactions,
-                        pending_events,
-                        transaction_buffers,
-                        tracer,
-                        lock_manager,
-                    )
+                    if victim_id is not None:
+                        pending_events = abort_deadlock_victim(
+                            victim_id,
+                            blocked_transactions,
+                            aborted_transactions,
+                            pending_events,
+                            transaction_buffers,
+                            tracer,
+                            lock_manager,
+                        )
+
+                        # Aborting a victim will change the lock state.
+                        pending_events = process_blocked_events(
+                            pending_events,
+                            blocked_transactions,
+                            aborted_transactions,
+                            lock_manager,
+                            transaction_buffers,
+                            tracer,
+                            db,
+                        )
 
                     continue
 
@@ -570,19 +658,34 @@ def two_phase_locking_sim(schedule: list[dict], tracer: Tracer, db: dict):
                         lock_manager,
                     )
 
-                    pending_events = abort_deadlock_victim_if_exists(
-                        victim_id,
-                        blocked_transactions,
-                        pending_events,
-                        transaction_buffers,
-                        tracer,
-                        lock_manager,
-                    )
+                    if victim_id is not None:
+                        pending_events = abort_deadlock_victim(
+                            victim_id,
+                            blocked_transactions,
+                            aborted_transactions,
+                            pending_events,
+                            transaction_buffers,
+                            tracer,
+                            lock_manager,
+                        )
+
+                        # Aborting a victim will change the lock state.
+                        pending_events = process_blocked_events(
+                            pending_events,
+                            blocked_transactions,
+                            aborted_transactions,
+                            lock_manager,
+                            transaction_buffers,
+                            tracer,
+                            db,
+                        )
 
                     continue
 
             case _:
                 raise Exception(f"Uknown event format: {event}")
+
+    print(pending_events)
 
 
 def load_schedule(path):
