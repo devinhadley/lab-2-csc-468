@@ -50,7 +50,7 @@ def get_latest_value_committed_before_snapshot(
     db: DBWithVersionHistory, start_timestamp: int, item: str
 ) -> int:
     for val, begin, end in reversed(db[item]):
-        if begin <= start_timestamp < end:
+        if begin <= start_timestamp < end:  # end kind of pointless
             return val
 
     raise Exception("No versioned value for " + item)
@@ -110,7 +110,7 @@ def mvcc_sim(schedule: list[dict], tracer: Tracer, db: DBWithVersionHistory):
         int, dict
     ] = {}  # txn -> item -> value (prevent dirty reads...)
     transaction_starts: dict[int, int] = {}  # txn -> start_time
-    clock = 0  # every commit the clock increments by one.
+    clock = 0  # every commit the clock increments by one. Esentially tracks
 
     for event in schedule:
         match event:
@@ -128,18 +128,17 @@ def mvcc_sim(schedule: list[dict], tracer: Tracer, db: DBWithVersionHistory):
                     latest_version_begin_timestamp = get_latest_value_start_time(
                         db, item
                     )
-
                     # We're overwriting a state we never even saw... ABORT!
                     if latest_version_begin_timestamp > transaction_starts[txn_id]:
-                        tracer.emit({"event": "ABORT", "t": txn_id})
-                        cleanup_transaction(
-                            transaction_buffers, transaction_starts, txn_id
-                        )
                         should_abort = True
                         break
 
                 if should_abort:
+                    tracer.emit({"event": "ABORT", "t": txn_id})
+                    cleanup_transaction(transaction_buffers, transaction_starts, txn_id)
                     continue
+
+                clock += 1
 
                 for item, value in transaction_buffers[txn_id].items():
                     write_new_value(db, clock, item, value)
